@@ -15,6 +15,21 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+class ScaledLinear(nn.Module):
+
+    def __init__(self, fan_in, fan_out, base_width, bias, is_proj=False):
+        super().__init__()
+        self.fan_in = fan_in
+        self.fan_out = fan_out
+        self.base_width = base_width
+        self.is_proj = is_proj 
+        self.linear = nn.Linear(fan_in, fan_out, bias=False)
+        
+    def forward(self, x):
+        return self.base_width / self.fan_in * self.linear(x)
+    
+    
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -32,15 +47,17 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = ScaledLinear(config.n_embd, 3 * config.n_embd, base_width=config.base_width, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = ScaledLinear(config.n_embd, config.n_embd, base_width=config.base_width, bias=config.bias, is_proj=True)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.head_dim = self.n_embd // self.n_head
+        self.base_head_dim = config.base_width // config.base_n_head
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -54,17 +71,18 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
+        
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=self.base_head_dim / (self.head_dim * math.sqrt(self.base_head_dim)))
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # At base_head_dim, I want the standard 1/sqrt(base_head_dim) scaling. 
+            att = (q @ k.transpose(-2, -1)) * (self.base_head_dim / (self.head_dim * math.sqrt(self.base_head_dim)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -79,9 +97,10 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = ScaledLinear(config.n_embd, 4 * config.n_embd, base_width=config.base_width, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        # Note: base width is 4*base width here. This is to have matching dynamics at base width (notice that fan_in is 4*width here).
+        self.c_proj  = ScaledLinear(4 * config.n_embd, config.n_embd, base_width=4 * config.base_width, bias=config.bias, is_proj=True) 
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -95,14 +114,18 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.base_n_layer = config.base_n_layer
+        self.n_layer = config.n_layer
+        self.depth_exp = config.depth_exp
+        
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + (self.base_n_layer / self.n_layer)**self.depth_exp * self.attn(self.ln_1(x))    
+        x = x + (self.base_n_layer / self.n_layer)**self.depth_exp * self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -114,6 +137,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    base_width = 192
+    base_n_layer = 3
+    base_n_head = 3
+    depth_exp = 1
 
 class GPT(nn.Module):
 
@@ -140,9 +167,9 @@ class GPT(nn.Module):
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # for pn, p in self.named_parameters():
+        #     if pn.endswith('c_proj.weight'):
+        #         torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -160,12 +187,17 @@ class GPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
+        if isinstance(module, ScaledLinear):
+            if module.is_proj:
+                # dividing by base n layers is to guarantee matching dynamics at base width, depth (original gpt model has a depth dependent initialization)
+                torch.nn.init.normal_(module.linear.weight, mean=0.0, std=0.02 * math.sqrt(module.fan_in / module.base_width) / math.sqrt(2 * self.config.base_n_layer))
+            else:
+                torch.nn.init.normal_(module.linear.weight, mean=0.0, std=0.02 * math.sqrt(module.fan_in / module.base_width))
+            if module.linear.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 * (self.config.n_layer / self.config.base_n_layer)**(self.config.depth_exp - 1))
+        
 
     def forward(self, idx, targets=None):
         device = idx.device
@@ -181,13 +213,14 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
+        out_mult = self.config.base_width / self.config.n_embd
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.lm_head(x) * out_mult
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) * out_mult # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -260,7 +293,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, epsilon):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -281,7 +314,7 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=epsilon, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
