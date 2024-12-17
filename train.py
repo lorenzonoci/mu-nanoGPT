@@ -32,8 +32,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
-eval_interval = 10
+eval_interval = 20
 log_interval = 1
 eval_iters = 5
 eval_only = False # if True, script exits right after the first eval
@@ -42,21 +41,24 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'gpt_2_scaling'
-wandb_run_name = 'gpt2_scaling_try_2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2_scaling_depth' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 1 * 3 # used to simulate larger batch sizes
-batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 1 * 4  # used to simulate larger batch sizes
+batch_size = 24 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 3
+n_layer = 24
 n_head = 3
 n_embd = 192
 depth_exp = 1
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# file names
+wandb_run_name += f"_{n_layer}"
+out_dir = 'out_' + wandb_run_name 
 # adamw optimizer
-learning_rate = 5e-4 # max learning rate
+learning_rate = 1e-4 # max learning rate
 max_iters = 50000 # total number of training iterations
 weight_decay = 0.0
 beta1 = 0.9
@@ -66,7 +68,7 @@ adam_epsilon = 1e-12
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = max_iters // 10 # should be ~= max_iters per Chinchilla
+lr_decay_iters = max_iters # should be ~= max_iters per Chinchilla
 min_lr = 1e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -273,6 +275,7 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+
         # if losses['val'] < best_val_loss or always_save_checkpoint:
         #     best_val_loss = losses['val']
         #     if iter_num > 0:
@@ -332,6 +335,18 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        #best_val_loss = losses['val']
+        if iter_num > 0:
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'best_val_loss': loss.item() * gradient_accumulation_steps, # TODO save best loss
+                'config': config,
+            }
+            print(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         break
 
 if ddp:
