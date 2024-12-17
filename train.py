@@ -41,21 +41,22 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'gpt_2_scaling'
-wandb_run_name = 'gpt2_scaling_depth' # 'run' + str(time.time())
+wandb_run_name = 'gpt2_scaling' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
+data_folder = '/pub/hofmann-scratch/lnoci'
 gradient_accumulation_steps = 1 * 4  # used to simulate larger batch sizes
 batch_size = 24 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
-n_layer = 24
-n_head = 3
-n_embd = 192
+n_layer = 3
+n_head = 6
+n_embd = 384
 depth_exp = 1
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # file names
-wandb_run_name += f"_{n_layer}"
+wandb_run_name += f"_heads_{n_head}_depth_{n_layer}_alpha_{depth_exp}"
 out_dir = 'out_' + wandb_run_name 
 # adamw optimizer
 learning_rate = 1e-4 # max learning rate
@@ -116,7 +117,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('/pub/hofmann-scratch/lnoci', dataset)
+data_dir = os.path.join(data_folder, dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -149,7 +150,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, depth_exp=depth_exp) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -200,7 +201,7 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, epsilon=adam_epsilon)
+optimizer = model.configure_optimizers(weight_decay, learning_rate * (n_layer / model.config.base_n_layer)**(depth_exp-1), (beta1, beta2), device_type, epsilon=adam_epsilon)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory

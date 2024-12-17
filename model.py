@@ -137,10 +137,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    base_width = 192
-    base_n_layer = 3
-    base_n_head = 3
-    depth_exp = 1
+    base_width: int = 192
+    base_n_layer: int = 3
+    base_n_head: int = 3
+    depth_exp: float = 1
 
 class GPT(nn.Module):
 
@@ -196,7 +196,7 @@ class GPT(nn.Module):
             if module.linear.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 * (self.config.n_layer / self.config.base_n_layer)**(self.config.depth_exp - 1))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / (self.config.n_layer / self.config.base_n_layer)**(1-self.config.depth_exp))
         
 
     def forward(self, idx, targets=None):
@@ -205,22 +205,24 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
+        depth_mult = (self.config.n_layer / self.config.base_n_layer)**(1-self.config.depth_exp)
+        
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop((tok_emb + pos_emb)*depth_mult)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer.ln_f(x) # TODO check how to scale this
 
         out_mult = self.config.base_width / self.config.n_embd
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x) * out_mult
+            logits = self.lm_head(x) * out_mult * depth_mult
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) * out_mult # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) * out_mult * depth_mult # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
